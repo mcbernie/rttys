@@ -1,122 +1,104 @@
 package main
 
 import (
-	"crypto/md5"
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/hex"
 	"flag"
-	"fmt"
-	"io"
-	"os"
-	"runtime"
-	"time"
-
-	"golang.org/x/crypto/ssh/terminal"
-
-	"github.com/kylelemons/go-gypsy/yaml"
+	"github.com/dwdcth/consoleEx"
+	"github.com/mattn/go-colorable"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/zhaojh329/rttys/version"
-
-	"github.com/howeyc/gopass"
-	"github.com/rifflock/lfshook"
-	log "github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh/terminal"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
 )
 
-type RttysConfig struct {
-	addr     string
-	sslCert  string
-	sslKey   string
-	username string
-	password string
-	token    string
-	baseURL  string
+type LogFileHook struct {
+	err  error
+	path string
+}
+
+var logFile = &LogFileHook{}
+
+func (h *LogFileHook) Run(e *zerolog.Event, level zerolog.Level, msg string) {
+	if h.err != nil {
+		return
+	}
+
+	f, err := os.OpenFile(h.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		h.err = err
+		log.Fatal().Msg(err.Error())
+		return
+	}
+	defer f.Close()
+
+	f.WriteString(zerolog.TimestampFunc().Format(zerolog.TimeFieldFormat) + " |")
+	f.WriteString(strings.ToUpper(level.String()) + "| ")
+
+	_, file, line, ok := runtime.Caller(3)
+	if ok {
+		f.WriteString(zerolog.CallerMarshalFunc(file, line) + " |")
+	}
+
+	f.WriteString(msg)
+	f.WriteString("\n")
 }
 
 func init() {
-	if terminal.IsTerminal(int(os.Stdout.Fd())) {
-		return
+	zerolog.CallerMarshalFunc = func(file string, line int) string {
+		return filepath.Base(file) + ":" + strconv.Itoa(line)
 	}
-	log.AddHook(lfshook.NewHook("/var/log/rttys.log", &log.TextFormatter{}))
+
+	out := consoleEx.ConsoleWriterEx{Out: colorable.NewColorableStdout()}
+	logger := zerolog.New(out).With().Caller().Timestamp().Logger()
+
+	if !terminal.IsTerminal(int(os.Stdout.Fd())) {
+		logger = logger.Hook(logFile)
+	}
+
+	log.Logger = logger
 }
 
 func main() {
+	if runtime.GOOS == "windows" {
+		flag.StringVar(&logFile.path, "log", "rttys.log", "log file path")
+	} else {
+		flag.StringVar(&logFile.path, "log", "/var/log/rttys.log", "log file path")
+	}
+
 	cfg := parseConfig()
 
+	if cfg.httpUsername == "" {
+		log.Fatal().Msg("You must configure the http username by commandline or config file")
+	}
 
-	log.Info("Go Version: ", runtime.Version())
-	log.Info("Go OS/Arch: ", runtime.GOOS, "/", runtime.GOARCH)
+	log.Info().Msg("Go Version: " + runtime.Version())
+	log.Info().Msgf("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH)
 
-	log.Info("Rttys Version: ", version.Version())
-	log.Info("Git Commit: ", version.GitCommit())
-	log.Info("Build Time: ", version.BuildTime())
+	log.Info().Msg("Rttys Version: " + version.Version())
 
-	br := newBroker()
+	gitCommit := version.GitCommit()
+	buildTime := version.BuildTime()
+
+	if gitCommit != "" {
+		log.Info().Msg("Git Commit: " + version.GitCommit())
+	}
+
+	if buildTime != "" {
+		log.Info().Msg("Build Time: " + version.BuildTime())
+	}
+
+	br := newBroker(cfg.token)
 	go br.run()
 
-	httpStart(br, cfg)
-}
+	go listenDevice(br, cfg)
+	go httpStart(br, cfg)
 
-func genUniqueID(extra string) string {
-	buf := make([]byte, 20)
-
-	binary.BigEndian.PutUint32(buf, uint32(time.Now().Unix()))
-	io.ReadFull(rand.Reader, buf[4:])
-
-	h := md5.New()
-	h.Write(buf)
-	h.Write([]byte(extra))
-
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func setConfigOpt(yamlCfg *yaml.File, name string, opt *string) {
-	val, err := yamlCfg.Get(name)
-	if err != nil {
-		return
+	for {
+		time.Sleep(time.Second)
 	}
-	*opt = val
-}
-
-func parseConfig() *RttysConfig {
-	cfg := &RttysConfig{}
-
-	flag.StringVar(&cfg.addr, "addr", ":5912", "address to listen")
-	flag.StringVar(&cfg.sslCert, "ssl-cert", "./rttys.crt", "certFile Path")
-	flag.StringVar(&cfg.sslKey, "ssl-key", "./rttys.key", "keyFile Path")
-	flag.StringVar(&cfg.token, "token", "", "token to use")
-	flag.StringVar(&cfg.baseURL, "base-url", "/", "base url to serve on")
-	conf := flag.String("conf", "./rttys.conf", "config file to load")
-	genToken := flag.Bool("gen-token", false, "generate token")
-
-	flag.Parse()
-
-	if *genToken {
-		genTokenAndExit()
-	}
-
-	yamlCfg, err := yaml.ReadFile(*conf)
-	if err == nil {
-		setConfigOpt(yamlCfg, "addr", &cfg.addr)
-		setConfigOpt(yamlCfg, "ssl-cert", &cfg.sslCert)
-		setConfigOpt(yamlCfg, "ssl-key", &cfg.sslKey)
-		setConfigOpt(yamlCfg, "username", &cfg.username)
-		setConfigOpt(yamlCfg, "password", &cfg.password)
-		setConfigOpt(yamlCfg, "token", &cfg.token)
-		setConfigOpt(yamlCfg, "base-url", &cfg.baseURL)
-	}
-
-	return cfg
-}
-
-func genTokenAndExit() {
-	password, err := gopass.GetPasswdPrompt("Please set a password:", true, os.Stdin, os.Stdout)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	token := genUniqueID(string(password))
-
-	fmt.Println("Your token is:", token)
-
-	os.Exit(0)
 }

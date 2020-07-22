@@ -1,18 +1,16 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
-	"os"
-	"strconv"
-	"time"
-
+	"github.com/gin-gonic/gin"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/rakyll/statik/fs"
-	log "github.com/sirupsen/logrus"
+	"github.com/rs/zerolog/log"
 	"github.com/zhaojh329/rttys/cache"
-	"github.com/zhaojh329/rttys/pwauth"
 	_ "github.com/zhaojh329/rttys/statik"
+	"io/ioutil"
+	"net/http"
+	"path"
+	"time"
 )
 
 type Credentials struct {
@@ -28,76 +26,160 @@ func allowOrigin(w http.ResponseWriter) {
 	w.Header().Set("content-type", "application/json")
 }
 
-func httpAuth(w http.ResponseWriter, r *http.Request) bool {
-	c, err := r.Cookie("sid")
-	if err != nil {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+func httpLogin(cfg *RttysConfig, creds *Credentials) bool {
+	if cfg.httpUsername != creds.Username {
 		return false
 	}
 
-	if _, ok := httpSessions.Get(c.Value); !ok {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return false
+	if cfg.httpPassword != "" {
+		return cfg.httpPassword == creds.Password
 	}
-
-	// Update
-	httpSessions.Del(c.Value)
-	httpSessions.Set(c.Value, true, 0)
 
 	return true
 }
 
-func httpLogin(cfg *RttysConfig, creds *Credentials) bool {
-	if err := pwauth.Auth(creds.Username, creds.Password); err == nil {
+func authorizedDev(devid string, cfg *RttysConfig) bool {
+	if cfg.whiteList == nil {
 		return true
 	}
 
-	if cfg.username != "" {
-		if cfg.username != creds.Username {
-			return false
-		}
+	_, ok := cfg.whiteList[devid]
+	return ok
+}
 
-		if cfg.password != "" {
-			return cfg.password == creds.Password
-		}
-
-		return true
+func httpAuth(c *gin.Context) bool {
+	cookie, err := c.Cookie("sid")
+	if err != nil || !httpSessions.Have(cookie) {
+		return false
 	}
 
-	return false
+	// Update
+	httpSessions.Del(cookie)
+	httpSessions.Set(cookie, true, 0)
+
+	return true
 }
 
 func httpStart(br *Broker, cfg *RttysConfig) {
 	httpSessions = cache.New(30*time.Minute, 5*time.Second)
 
-	statikFS, err := fs.New()
-	if err != nil {
-		log.Fatal(err)
-	}
+	gin.SetMode(gin.ReleaseMode)
 
-	staticfs := http.FileServer(statikFS)
+	r := gin.New()
 
-	if cfg.baseURL == "/" {
-		cfg.baseURL = ""
-	}
+	authorized := r.Group("/", func(c *gin.Context) {
+		devid := c.Param("devid")
+		if devid != "" && authorizedDev(devid, cfg) {
+			return
+		}
 
-	http.HandleFunc(cfg.baseURL+"/ws", func(w http.ResponseWriter, r *http.Request) {
-		serveWs(br, w, r, cfg)
+		if !httpAuth(c) {
+			c.AbortWithStatus(http.StatusUnauthorized)
+		}
 	})
 
-	http.HandleFunc(cfg.baseURL+"/cmd", func(w http.ResponseWriter, r *http.Request) {
-		allowOrigin(w)
-		serveCmd(br, w, r)
+	authorized.GET("/fontsize/:devid", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"size": cfg.fontSize})
 	})
 
-	http.HandleFunc(cfg.baseURL+"/signin", func(w http.ResponseWriter, r *http.Request) {
+	authorized.POST("/fontsize/:devid", func(c *gin.Context) {
+		type Resp struct {
+			Size int `json:"size"`
+		}
+		var r Resp
+		err := c.BindJSON(&r)
+		if err != nil {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+
+		cfg.fontSize = r.Size
+		c.String(http.StatusOK, "OK")
+	})
+
+	authorized.GET("/connect/:devid", func(c *gin.Context) {
+		if c.GetHeader("Upgrade") != "websocket" {
+			c.Redirect(http.StatusFound, "/rtty/"+c.Param("devid"))
+			return
+		}
+		serveUser(br, c)
+	})
+
+	authorized.GET("/devs", func(c *gin.Context) {
+		type DeviceInfo struct {
+			ID          string `json:"id"`
+			Uptime      int64  `json:"uptime"`
+			Description string `json:"description"`
+		}
+
+		devs := make([]DeviceInfo, 0)
+
+		for id, dev := range br.devices {
+			dev := DeviceInfo{id, time.Now().Unix() - dev.timestamp, dev.desc}
+			devs = append(devs, dev)
+		}
+
+		allowOrigin(c.Writer)
+
+		c.JSON(http.StatusOK, devs)
+	})
+
+	authorized.GET("/cmd/:devid/:token", func(c *gin.Context) {
+		allowOrigin(c.Writer)
+
+		done := make(chan struct{})
+		req := &CommandReq{
+			done: done,
+			w:    c.Writer,
+		}
+
+		req.token = c.Param("token")
+
+		br.cmdReq <- req
+		<-done
+	})
+
+	authorized.POST("/cmd/:devid", func(c *gin.Context) {
+		allowOrigin(c.Writer)
+
+		done := make(chan struct{})
+		req := &CommandReq{
+			done:  done,
+			w:     c.Writer,
+			devid: c.Param("devid"),
+		}
+
+		content, err := ioutil.ReadAll(c.Request.Body)
+		if err != nil {
+			c.Status(http.StatusBadRequest)
+			return
+		}
+
+		sid := jsoniter.Get(content, "sid").ToString()
+		if _, ok := httpSessions.Get(sid); !ok {
+			c.Status(http.StatusForbidden)
+			return
+		}
+
+		req.content = content
+
+		br.cmdReq <- req
+		<-done
+	})
+
+	r.GET("/authorized/:devid", func(c *gin.Context) {
+		authorized := authorizedDev(c.Param("devid"), cfg) || httpAuth(c)
+		c.JSON(http.StatusOK, gin.H{
+			"authorized": authorized,
+		})
+	})
+
+	r.POST("/signin", func(c *gin.Context) {
 		var creds Credentials
 
-		// Get the JSON body and decode into credentials
-		err := jsoniter.NewDecoder(r.Body).Decode(&creds)
+		err := jsoniter.NewDecoder(c.Request.Body).Decode(&creds)
 		if err != nil {
-			// If the structure of the body is wrong, return an HTTP error
-			w.WriteHeader(http.StatusBadRequest)
+			c.Status(http.StatusBadRequest)
 			return
 		}
 
@@ -105,76 +187,37 @@ func httpStart(br *Broker, cfg *RttysConfig) {
 			sid := genUniqueID("http")
 			httpSessions.Set(sid, true, 0)
 
-			http.SetCookie(w, &http.Cookie{
-				Name:     "sid",
-				Value:    sid,
-				HttpOnly: true,
-			})
-			fmt.Fprint(w, sid)
+			c.SetCookie("sid", sid, 0, "", "", false, true)
+			c.String(http.StatusOK, sid)
 			return
 		}
 
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		c.Status(http.StatusForbidden)
 	})
 
-	http.HandleFunc(cfg.baseURL+"/devs", func(w http.ResponseWriter, r *http.Request) {
-		if !httpAuth(w, r) {
+	statikFS, err := fs.New()
+	if err != nil {
+		log.Fatal().Msg(err.Error())
+	}
+
+	r.NoRoute(func(c *gin.Context) {
+		f, err := statikFS.Open(path.Clean(c.Request.URL.Path))
+		if err != nil {
+			c.Request.URL.Path = "/"
+			r.HandleContext(c)
 			return
 		}
-
-		devs := []DeviceInfo{}
-
-		for id, dev := range br.devices {
-			dev := DeviceInfo{id, time.Now().Unix() - dev.timestamp, dev.desc}
-			devs = append(devs, dev)
-		}
-
-		allowOrigin(w)
-
-		resp, _ := jsoniter.Marshal(devs)
-
-		w.Write(resp)
+		f.Close()
+		http.FileServer(statikFS).ServeHTTP(c.Writer, c.Request)
 	})
 
-	hfunc := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			t := r.URL.Query().Get("t")
-			id := r.URL.Query().Get("id")
-
-			if t == "" && id == "" {
-				http.Redirect(w, r, cfg.baseURL+"?t="+strconv.FormatInt(time.Now().Unix(), 10), http.StatusFound)
-				return
-			}
-		}
-
-		staticfs.ServeHTTP(w, r)
-	})
-
-	if cfg.baseURL != "" {
-		http.Handle(cfg.baseURL+"/", http.StripPrefix(cfg.baseURL, hfunc))
-	} else {
-		http.Handle("/", hfunc)
-	}
-
 	if cfg.sslCert != "" && cfg.sslKey != "" {
-		_, err := os.Lstat(cfg.sslCert)
-		if err != nil {
-			log.Error(err)
-			cfg.sslCert = ""
-		}
-
-		_, err = os.Lstat(cfg.sslKey)
-		if err != nil {
-			log.Error(err)
-			cfg.sslKey = ""
-		}
-	}
-
-	if cfg.sslCert != "" && cfg.sslKey != "" {
-		log.Info("Listen on: ", cfg.addr, " SSL on")
-		log.Fatal(http.ListenAndServeTLS(cfg.addr, cfg.sslCert, cfg.sslKey, nil))
+		log.Info().Msgf("Listen user on: %s SSL on", cfg.addrUser)
+		err = r.RunTLS(cfg.addrUser, cfg.sslCert, cfg.sslKey)
 	} else {
-		log.Info("Listen on: ", cfg.addr, " SSL off")
-		log.Fatal(http.ListenAndServe(cfg.addr, nil))
+		log.Info().Msgf("Listen user on: %s SSL off", cfg.addrUser)
+		err = r.Run(cfg.addrUser)
 	}
+
+	log.Fatal().Err(err)
 }

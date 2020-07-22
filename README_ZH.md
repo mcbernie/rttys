@@ -1,12 +1,12 @@
 # rttys
 
-[1]: https://img.shields.io/badge/license-LGPL2-brightgreen.svg?style=plastic
+[1]: https://img.shields.io/badge/license-MIT-brightgreen.svg?style=plastic
 [2]: /LICENSE
 [3]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=plastic
 [4]: https://github.com/zhaojh329/rttys/pulls
 [5]: https://img.shields.io/badge/Issues-welcome-brightgreen.svg?style=plastic
 [6]: https://github.com/zhaojh329/rttys/issues/new
-[7]: https://img.shields.io/badge/release-2.10.2-blue.svg?style=plastic
+[7]: https://img.shields.io/badge/release-3.1.3-blue.svg?style=plastic
 [8]: https://github.com/zhaojh329/rttys/releases
 [9]: https://travis-ci.org/zhaojh329/rttys.svg?branch=master
 [10]: https://travis-ci.org/zhaojh329/rttys
@@ -24,30 +24,32 @@
 
     go get -u github.com/zhaojh329/rttys
 
-## 查看支持哪些命令行参数
+## 命令行参数
 
     ./rttys -h
-    Usage of ./rttys:
-      -addr string
-            address to listen (default ":5912")
+    Usage of rttys:
+      -addr-dev string
+            address to listen device (default ":5912")
+      -addr-user string
+            address to listen user (default ":5913")
       -conf string
             config file to load (default "./rttys.conf")
       -gen-token
             generate token
+      -http-password string
+            password for http auth
+      -http-username string
+            username for http auth
+      -log string
+            log file path (default "/var/log/rttys.log")
       -ssl-cert string
-            certFile Path (default "./rttys.crt")
+            certFile Path
       -ssl-key string
-            keyFile Path (default "./rttys.key")
+            keyFile Path
       -token string
             token to use
-
-## 运行
-
-    sudo ./rttys
-
-## 如何在后台运行模式下查看日志
-
-    cat /var/log/rttys.log
+      -white-list string
+            white list(device IDs separated by spaces or *)
 
 ## 认证
 
@@ -56,6 +58,39 @@
     Your token is: 34762d07637276694b938d23f10d7164
 
     ./rttys -token 34762d07637276694b938d23f10d7164
+
+## 作为Linux服务运行
+移动rttys可执行程序到/usr/local/bin/
+
+    sudo mv rttys /usr/local/bin/
+
+拷贝配置文件到/etc/rttys/
+
+    sudo mkdir /etc/rttys
+    sudo cp rttys.conf /etc/rttys/
+
+创建一个systemd单元文件: /etc/systemd/system/rttys.service
+
+    [Unit]
+    Description=rttys
+    After=network.target
+
+    [Service]
+    ExecStart=/usr/local/bin/rttys -conf /etc/rttys/rttys.conf
+    TimeoutStopSec=5s
+
+    [Install]
+    WantedBy=multi-user.target
+
+要首次启动该服务，请执行通常的systemctl操作:
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable rttys
+    sudo systemctl start rttys
+
+您可以通过以下方式停止服务:
+
+    sudo systemctl stop rttys
 
 # 贡献代码
 如果你想帮助[rttys](https://github.com/zhaojh329/rttys)变得更好，请参考
